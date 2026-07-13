@@ -49,8 +49,12 @@ pub struct EnrichmentRecallRequest<'a> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResultKind {
     /// Results are new context derived by the external system.
+    ///
+    /// Derived entries do not need to identify a canonical SQLite session;
+    /// the enricher owns the semantics of the scoped recall request.
     DerivedContext,
     /// Results identify canonical SQLite rows by key and optional agent ID.
+    /// Rehydrated rows remain subject to canonical session filtering.
     CanonicalRowReference,
 }
 
@@ -430,7 +434,17 @@ impl<E: MemoryEnricher> EnrichedMemory<E> {
                     .prepare_enrichment_results(enrichment_results, request.allowed_agent_ids)
                     .await?;
                 let merged = Self::merge_results(local_results, enrichment_results, request.limit);
-                let merged = Self::filter_enrichment_session(merged, request.session_id);
+                // Canonical references are rehydrated from SQLite and must obey
+                // the caller's session boundary. Derived context has no
+                // canonical SQLite session (Lucid returns `None`) and is owned
+                // by the enricher's declared recall semantics, so filtering it
+                // here would silently discard every result on normal
+                // session-scoped recalls.
+                let merged = if capabilities.result_kind == ResultKind::CanonicalRowReference {
+                    Self::filter_enrichment_session(merged, request.session_id)
+                } else {
+                    merged
+                };
                 Ok(Self::filter_enrichment_window(merged, since_dt, until_dt))
             }
             Ok(_) => {
@@ -456,6 +470,11 @@ impl<E: MemoryEnricher> EnrichedMemory<E> {
 
 #[async_trait]
 impl<E: MemoryEnricher> Memory for EnrichedMemory<E> {
+    // Keep every `Memory` method explicitly delegated. Inheriting an additive
+    // trait default here can silently disable canonical SQLite behavior behind
+    // the enrichment seam; `canonical_sqlite_surface_is_fully_delegated`
+    // exercises the default-bearing lifecycle methods most prone to that
+    // regression.
     fn name(&self) -> &str {
         self.enricher.name()
     }
@@ -1116,6 +1135,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn derived_context_survives_session_scoped_recall() {
+        let temp = TempDir::new().unwrap();
+        let memory = test_memory(&temp, derived_capabilities(), 10, Duration::from_secs(1));
+        memory.enricher.state.lock().recall_results =
+            vec![entry("derived", "connector-derived context", None, 0.9)];
+
+        let recalled = memory
+            .recall("remote-only", 5, Some("session-a"), None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].key, "derived");
+        assert_eq!(recalled[0].session_id, None);
+    }
+
+    #[tokio::test]
+    async fn canonical_references_still_obey_session_scope_after_rehydration() {
+        let temp = TempDir::new().unwrap();
+        let memory = test_memory(
+            &temp,
+            capabilities(
+                ResultKind::CanonicalRowReference,
+                RecallScope::AgentAllowlist,
+                RecallSupport::SemanticOnly,
+                CleanupSupport::None,
+            ),
+            10,
+            Duration::from_secs(1),
+        );
+        let agent_id = memory.ensure_agent_uuid("agent-a").await.unwrap();
+        memory
+            .store_with_agent(
+                "session-a-row",
+                "canonical local payload",
+                MemoryCategory::Core,
+                Some("session-a"),
+                None,
+                None,
+                Some(&agent_id),
+            )
+            .await
+            .unwrap();
+        memory.enricher.state.lock().recall_results = vec![entry(
+            "session-a-row",
+            "stale remote payload",
+            Some(&agent_id),
+            0.9,
+        )];
+
+        let recalled = memory
+            .recall_for_agents(
+                &[&agent_id],
+                "remote-only",
+                5,
+                Some("session-b"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(recalled.is_empty());
+    }
+
+    #[tokio::test]
     async fn cleanup_runs_only_when_declared_even_without_local_rows() {
         let supported_temp = TempDir::new().unwrap();
         let supported = test_memory(
@@ -1455,5 +1540,69 @@ mod tests {
         assert_eq!(state.store_calls[0].namespace.as_deref(), Some("project-a"));
         assert_eq!(state.store_calls[0].importance, Some(0.75_f64.to_bits()));
         assert_eq!(state.store_calls[1].key, "second");
+    }
+
+    #[tokio::test]
+    async fn canonical_sqlite_surface_is_fully_delegated() {
+        let temp = TempDir::new().unwrap();
+        let memory = test_memory(&temp, derived_capabilities(), 10, Duration::from_secs(1));
+        let agent_a_id = memory.ensure_agent_uuid("agent-a").await.unwrap();
+        let agent_b_id = memory.ensure_agent_uuid("agent-b").await.unwrap();
+
+        memory
+            .store_with_agent(
+                "namespace-row",
+                "namespace payload",
+                MemoryCategory::Core,
+                Some("session-a"),
+                Some("namespace-a"),
+                None,
+                Some(&agent_a_id),
+            )
+            .await
+            .unwrap();
+        memory
+            .store_with_agent(
+                "session-row",
+                "session payload",
+                MemoryCategory::Daily,
+                Some("session-b"),
+                Some("namespace-b"),
+                None,
+                Some(&agent_b_id),
+            )
+            .await
+            .unwrap();
+
+        assert!(memory.health_check().await);
+        assert_eq!(memory.count().await.unwrap(), 2);
+        assert_eq!(memory.count_agent("agent-a").await.unwrap(), 1);
+        assert_eq!(memory.export_agent("agent-a").await.unwrap().len(), 1);
+        assert_eq!(
+            memory
+                .rename_agent("agent-a", "agent-renamed")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(memory.count_agent("agent-a").await.unwrap(), 0);
+        assert_eq!(memory.count_agent("agent-renamed").await.unwrap(), 1);
+        assert_eq!(memory.export_agent("agent-renamed").await.unwrap().len(), 1);
+
+        assert_eq!(memory.purge_session("session-b").await.unwrap(), 1);
+        assert_eq!(memory.purge_namespace("namespace-a").await.unwrap(), 1);
+        assert_eq!(memory.count().await.unwrap(), 0);
+
+        memory
+            .store(
+                "unscoped-row",
+                "unscoped payload",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(memory.forget("unscoped-row").await.unwrap());
+        assert_eq!(memory.count().await.unwrap(), 0);
     }
 }

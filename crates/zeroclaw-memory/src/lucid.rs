@@ -580,6 +580,23 @@ exit 1
     }
 
     #[tokio::test]
+    async fn session_scoped_recall_keeps_lucid_derived_context() {
+        let tmp = TempDir::new().unwrap();
+        let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
+
+        let entries = memory
+            .recall("auth", 5, Some("session-a"), None, None)
+            .await
+            .unwrap();
+
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.content.contains("token refresh"))
+        );
+    }
+
+    #[tokio::test]
     async fn recent_recall_invokes_lucid_when_local_results_are_insufficient() {
         let tmp = TempDir::new().unwrap();
         let memory = test_memory(tmp.path(), write_fake_lucid_script(tmp.path()));
