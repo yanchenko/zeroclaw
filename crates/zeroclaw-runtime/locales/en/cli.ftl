@@ -140,7 +140,7 @@ cli-memory-list-about = List memory entries with optional filters
 cli-memory-get-about = Get a specific memory entry by key
 cli-memory-stats-about = Show memory backend statistics and health
 cli-memory-clear-about = Clear memories by category, by key, or clear all
-cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, or postgres)
+cli-memory-clear-unsupported-backend = memory clear is unsupported for append-only backend '{$backend}'; switch to a deletable backend (sqlite, lucid, shodh, or postgres)
 
 cli-estop-status-about = Print current estop status
 cli-estop-resume-about = Resume from an engaged estop level
@@ -1035,4 +1035,3 @@ cli-doctor-ctxwin-saved = Saved {$updated} updates to config.toml
 cli-doctor-ctxwin-dry-run = Dry run complete — no changes written. Run without --dry-run to apply.
 cli-doctor-ctxwin-none = No updates needed.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: failed to write context_window: {$error}
-

@@ -581,7 +581,7 @@ enum Commands {
         #[arg(long, hide = true)]
         model: Option<String>,
 
-        /// Memory backend (sqlite, lucid, markdown, none).
+        /// Memory backend (sqlite, lucid, shodh, markdown, none).
         #[arg(long, hide = true)]
         memory: Option<String>,
 
@@ -1828,17 +1828,18 @@ async fn run_quickstart_cli(
                 }
             }
             Action::Memory => {
-                // Schema-derived list — six variants today, more as
+                // Schema-derived list — seven variants today, more as
                 // soon as someone adds them to
                 // `zeroclaw_config::multi_agent::MemoryBackendKind`.
                 // The exhaustive `match` here keeps the variant
                 // array honest at compile time.
-                let kinds: [MemoryChoice; 6] = [
+                let kinds: [MemoryChoice; 7] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
                     MemoryChoice::Postgres,
                     MemoryChoice::Qdrant,
                     MemoryChoice::Lucid,
+                    MemoryChoice::Shodh,
                     MemoryChoice::None,
                 ];
                 #[allow(clippy::no_effect_underscore_binding)]
@@ -1848,6 +1849,7 @@ async fn run_quickstart_cli(
                     | MemoryChoice::Postgres
                     | MemoryChoice::Qdrant
                     | MemoryChoice::Lucid
+                    | MemoryChoice::Shodh
                     | MemoryChoice::None => (),
                 };
                 let labels: Vec<String> = kinds

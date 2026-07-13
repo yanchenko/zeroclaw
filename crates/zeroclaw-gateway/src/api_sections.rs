@@ -691,6 +691,7 @@ fn storage_rank(key: &str) -> usize {
         "qdrant" => 2,
         "markdown" => 3,
         "lucid" => 4,
+        "shodh" => 5,
         _ => 99,
     }
 }
@@ -712,6 +713,9 @@ fn storage_description(key: &str) -> Option<&'static str> {
         "lucid" => {
             Some("Bridge to local lucid-memory CLI while keeping SQLite-style local operation.")
         }
+        "shodh" => Some(
+            "Authenticated Shodh semantic recall while SQLite remains the authoritative store.",
+        ),
         _ => None,
     }
 }
@@ -1142,7 +1146,7 @@ pub async fn handle_section_select(
             // Two-tier typed-family (`storage.<kind>.<alias>`) — same
             // shape and selection flow as model_providers / tts_providers /
             // transcription_providers. Outer bucket is the storage kind
-            // (sqlite, postgres, qdrant, markdown, lucid); inner key is
+            // (sqlite, postgres, qdrant, markdown, lucid, shodh); inner key is
             // the operator-named alias.
             let created = working
                 .create_map_key(&format!("storage.{key}"), &alias)
@@ -1949,15 +1953,15 @@ mod tests {
 
     /// Storage is `[storage.<kind>.<alias>]` — two-tier typed-family
     /// shape, served by the storage picker. The picker
-    /// surfaces the 5 storage kinds (sqlite, postgres, qdrant,
-    /// markdown, lucid) regardless of which aliases exist, and badges
+    /// surfaces the 6 storage kinds (sqlite, postgres, qdrant,
+    /// markdown, lucid, shodh) regardless of which aliases exist, and badges
     /// the kind `created` once any alias under it is created.
     #[test]
     fn storage_picker_lists_all_kinds_and_marks_created() {
         let cfg = empty_cfg();
         let items = storage_picker(&cfg);
         let keys: Vec<&str> = items.iter().map(|i| i.key.as_str()).collect();
-        for expected in ["sqlite", "postgres", "qdrant", "markdown", "lucid"] {
+        for expected in ["sqlite", "postgres", "qdrant", "markdown", "lucid", "shodh"] {
             assert!(
                 keys.contains(&expected),
                 "storage picker must list `{expected}`, got: {keys:?}",

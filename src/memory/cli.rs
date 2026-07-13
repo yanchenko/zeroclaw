@@ -114,6 +114,14 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
         MemoryBackendKind::None => {
             bail!("Memory backend is 'none' (disabled). No entries to manage.");
         }
+        MemoryBackendKind::Shodh => create_memory_with_storage_and_routes(
+            &config.memory,
+            &config.embedding_routes,
+            config.resolve_active_storage(),
+            &config.data_dir,
+            None,
+            Some(&config.providers.models),
+        ),
         _ => create_memory_for_migration(&backend, &config.data_dir),
     }
 }
@@ -328,7 +336,7 @@ fn unsupported_clear_backend_message(backend: &str) -> String {
     #[cfg(not(feature = "agent-runtime"))]
     {
         format!(
-            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite, lucid, or postgres)"
+            "memory clear is unsupported for append-only backend '{backend}'; switch to a deletable backend (sqlite, lucid, shodh, or postgres)"
         )
     }
 }

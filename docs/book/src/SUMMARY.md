@@ -49,6 +49,7 @@
 - [Reference](./reference/index.md)
   - [CLI](./reference/cli.md)
   - [Config](./reference/config.md)
+  - [Memory backends](./reference/memory-backends.md)
   - [Environment variables](./reference/env-vars.md)
   - [Feature and support matrix](./reference/feature-matrix.md)
   - [API (rustdoc)](./api.md)

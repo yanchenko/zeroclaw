@@ -146,6 +146,7 @@ pub enum MemoryBackendKind {
     Qdrant,
     Markdown,
     Lucid,
+    Shodh,
 }
 
 // ── Quickstart state / step / surface ──────────────────────────

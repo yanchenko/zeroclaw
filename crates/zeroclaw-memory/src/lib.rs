@@ -51,6 +51,7 @@ pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
+pub mod shodh;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
@@ -79,6 +80,7 @@ pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
+pub use shodh::ShodhMemory;
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -136,6 +138,12 @@ where
         MemoryBackendKind::Lucid => {
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new("lucid", workspace_dir, local)))
+        }
+        MemoryBackendKind::Shodh => {
+            anyhow::bail!(
+                "shodh backend requires storage config; call \
+                 create_memory_with_storage_and_routes instead of create_memory_with_builders"
+            )
         }
         MemoryBackendKind::Postgres => {
             // Postgres requires a typed `[storage.postgres.<alias>]` config, which this
@@ -503,8 +511,8 @@ pub fn create_memory(
 ///
 /// Pass [`ActiveStorage::None`] when no typed storage config is needed (sqlite,
 /// markdown, none, or legacy bare Lucid defaults). A configured Lucid alias is
-/// consumed when supplied. Postgres and Qdrant require their typed variants and
-/// will error if the wrong variant is supplied.
+/// consumed when supplied. Postgres, Qdrant, and Shodh require their typed
+/// variants and will error if the wrong variant is supplied.
 ///
 /// `providers` is the canonical `providers.models` catalog, used to resolve a
 /// dotted `<type>.<alias>` embedding `model_provider` reference (from
@@ -538,10 +546,7 @@ pub fn create_memory_with_storage_and_routes(
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
     if config.snapshot_enabled
         && config.snapshot_on_hygiene
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
+        && memory_backend_profile(&backend_name).sqlite_based
         && let Err(e) = snapshot::export_snapshot(workspace_dir)
     {
         ::zeroclaw_log::record!(
@@ -556,10 +561,7 @@ pub fn create_memory_with_storage_and_routes(
     // Auto-hydration: if brain.db is missing but MEMORY_SNAPSHOT.md exists,
     // restore the "soul" from the snapshot before creating the backend.
     if config.auto_hydrate
-        && matches!(
-            backend_kind,
-            MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid
-        )
+        && memory_backend_profile(&backend_name).sqlite_based
         && snapshot::should_hydrate(workspace_dir)
     {
         ::zeroclaw_log::record!(
@@ -662,6 +664,20 @@ pub fn create_memory_with_storage_and_routes(
             ),
         };
         return Ok(Box::new(memory));
+    }
+
+    if matches!(backend_kind, MemoryBackendKind::Shodh) {
+        let shodh_cfg = match active_storage {
+            ActiveStorage::Shodh(shodh) => shodh,
+            _ => anyhow::bail!(
+                "memory backend 'shodh' requires a `[storage.shodh.<alias>]` entry \
+                 referenced by `memory.backend = \"shodh.<alias>\"`"
+            ),
+        };
+        let local = build_sqlite_memory(config, None, workspace_dir, &resolved_embedding)?;
+        return Ok(Box::new(ShodhMemory::from_config(
+            "shodh", local, shodh_cfg,
+        )?));
     }
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
@@ -941,7 +957,7 @@ pub async fn create_memory_for_agent(
         return Ok(Arc::new(NoneMemory::new("none")));
     }
 
-    // SQL / Qdrant / Lucid: single install-wide backend; the
+    // SQL / Qdrant / Lucid / Shodh: single install-wide backend; the
     // agent_id column (or payload field) carries the per-agent
     // attribution. We synthesize the inner backend from the existing
     // install-wide factory using the install workspace_dir, then wrap
@@ -1021,9 +1037,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
-    use zeroclaw_config::schema::EmbeddingRouteConfig;
     #[cfg(unix)]
     use zeroclaw_config::schema::{Config, LucidStorageConfig};
+    use zeroclaw_config::schema::{EmbeddingRouteConfig, ShodhStorageConfig};
 
     #[cfg(unix)]
     fn write_timed_lucid_script(
@@ -1521,6 +1537,42 @@ exit 1
         let local = memory.get("agent_probe").await.unwrap().unwrap();
         assert_eq!(local.content, "SQLite stays authoritative");
         assert!(local.agent_id.is_some());
+    }
+
+    #[test]
+    fn factory_shodh_uses_typed_storage_config() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "shodh.semantic".into(),
+            ..MemoryConfig::default()
+        };
+        let storage = ShodhStorageConfig {
+            api_key: Some("test-key".into()),
+            ..ShodhStorageConfig::default()
+        };
+        let mem = create_memory_with_storage_and_routes(
+            &cfg,
+            &[],
+            ActiveStorage::Shodh(&storage),
+            tmp.path(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mem.name(), "shodh");
+    }
+
+    #[test]
+    fn factory_shodh_without_storage_alias_errors() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "shodh.default".into(),
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("backend=shodh requires a [storage.shodh.<alias>] entry");
+        assert!(error.to_string().contains("storage.shodh"));
     }
 
     #[test]

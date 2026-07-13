@@ -384,8 +384,8 @@ sections! {
         group: Storage,
         help:  "SQLite is the safe default for single-node installs (file-based, \
                 zero-config, no extra services). Pick Postgres for shared or \
-                multi-instance deployments, Qdrant for vector search, Markdown or \
-                Lucid for human-readable files. Each backend supports multiple \
+                multi-instance deployments, Qdrant for vector search, Markdown for \
+                human-readable files, or Lucid and Shodh for local-first enrichment. Each backend supports multiple \
                 aliased instances; agents reference them via `memory.storage_ref`.",
     },
     Memory => {

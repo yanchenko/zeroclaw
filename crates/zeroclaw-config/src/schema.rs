@@ -4412,6 +4412,12 @@ impl Config {
                 .get(alias)
                 .map(ActiveStorage::Lucid)
                 .unwrap_or(ActiveStorage::None),
+            "shodh" => self
+                .storage
+                .shodh
+                .get(alias)
+                .map(ActiveStorage::Shodh)
+                .unwrap_or(ActiveStorage::None),
             _ => ActiveStorage::None,
         }
     }
@@ -4462,6 +4468,7 @@ impl Config {
             }
             MemoryBackendKind::Qdrant => self.storage.qdrant.keys().map(String::as_str).collect(),
             MemoryBackendKind::Lucid => self.storage.lucid.keys().map(String::as_str).collect(),
+            MemoryBackendKind::Shodh => self.storage.shodh.keys().map(String::as_str).collect(),
             MemoryBackendKind::None | MemoryBackendKind::Markdown => unreachable!(),
         };
         if aliases.is_empty() {
@@ -4503,6 +4510,8 @@ pub enum ActiveStorage<'a> {
     Markdown(&'a MarkdownStorageConfig),
     /// Lucid CLI sync instance.
     Lucid(&'a LucidStorageConfig),
+    /// Shodh Memory HTTP instance.
+    Shodh(&'a ShodhStorageConfig),
 }
 
 impl ActiveStorage<'_> {
@@ -4516,6 +4525,7 @@ impl ActiveStorage<'_> {
             ActiveStorage::Qdrant(_) => "qdrant",
             ActiveStorage::Markdown(_) => "markdown",
             ActiveStorage::Lucid(_) => "lucid",
+            ActiveStorage::Shodh(_) => "shodh",
         }
     }
 }
@@ -10213,6 +10223,10 @@ pub struct StorageConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub lucid: HashMap<String, LucidStorageConfig>,
+    /// Shodh Memory HTTP instances (`[storage.shodh.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub shodh: HashMap<String, ShodhStorageConfig>,
 }
 
 /// SQLite storage backend (`[storage.sqlite.<alias>]`).
@@ -10327,6 +10341,45 @@ pub struct LucidStorageConfig {
     /// Maximum milliseconds allowed for a Lucid store command.
     /// Defaults to 800 when omitted and must be greater than zero when set.
     pub store_timeout_ms: Option<u64>,
+}
+
+/// Shodh Memory HTTP mirror (`[storage.shodh.<alias>]`).
+///
+/// SQLite remains authoritative. Shodh provides semantic recall enrichment
+/// through its authenticated sidecar API.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "storage_shodh"]
+#[serde(default)]
+pub struct ShodhStorageConfig {
+    /// Shodh server origin, without an `/api` suffix.
+    pub base_url: String,
+    /// API key sent in the `X-API-Key` request header.
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Maximum time to wait for semantic recall.
+    pub recall_timeout_ms: u64,
+    /// Maximum time to wait for stores and deletions.
+    pub store_timeout_ms: u64,
+    /// Skip remote recall once SQLite already produced this many hits.
+    pub local_hit_threshold: usize,
+    /// Suppress repeated remote recall attempts after a failure.
+    pub failure_cooldown_ms: u64,
+}
+
+impl Default for ShodhStorageConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "http://127.0.0.1:3030".into(),
+            api_key: None,
+            recall_timeout_ms: 2_000,
+            store_timeout_ms: 5_000,
+            local_hit_threshold: 3,
+            failure_cooldown_ms: 15_000,
+        }
+    }
 }
 
 fn default_storage_schema() -> String {
@@ -23461,6 +23514,67 @@ auto_save = true
         assert!(storage.qdrant.is_empty());
         assert!(storage.markdown.is_empty());
         assert!(storage.lucid.is_empty());
+        assert!(storage.shodh.is_empty());
+    }
+
+    #[test]
+    async fn storage_shodh_alias_roundtrip_and_resolves() {
+        let toml = r#"
+            [shodh.semantic]
+            base_url = "https://memory.example.test"
+            api_key = "secret"
+            recall_timeout_ms = 1200
+            store_timeout_ms = 3400
+            local_hit_threshold = 4
+            failure_cooldown_ms = 9000
+        "#;
+        let storage: StorageConfig = toml::from_str(toml).unwrap();
+        let shodh = storage.shodh.get("semantic").expect("alias present");
+        assert_eq!(shodh.base_url, "https://memory.example.test");
+        assert_eq!(shodh.api_key.as_deref(), Some("secret"));
+        assert_eq!(shodh.recall_timeout_ms, 1200);
+        assert_eq!(shodh.store_timeout_ms, 3400);
+        assert_eq!(shodh.local_hit_threshold, 4);
+        assert_eq!(shodh.failure_cooldown_ms, 9000);
+
+        let mut config = Config::default();
+        config.memory.backend = "shodh.semantic".into();
+        config.storage = storage;
+        assert_eq!(config.resolve_active_storage().kind(), "shodh");
+        let ActiveStorage::Shodh(resolved) = config.resolve_active_storage() else {
+            panic!("shodh alias should resolve to its typed storage config");
+        };
+        assert_eq!(resolved.base_url, "https://memory.example.test");
+    }
+
+    #[test]
+    async fn storage_shodh_defaults_are_local_and_bounded() {
+        let config = ShodhStorageConfig::default();
+        assert_eq!(config.base_url, "http://127.0.0.1:3030");
+        assert!(config.api_key.is_none());
+        assert!(config.recall_timeout_ms > 0);
+        assert!(config.store_timeout_ms > 0);
+        assert!(config.local_hit_threshold > 0);
+        assert!(config.failure_cooldown_ms > 0);
+    }
+
+    #[test]
+    async fn storage_shodh_alias_is_creatable_through_config_surface() {
+        let mut config = Config::default();
+        config.init_defaults(None);
+        assert!(config.create_map_key("storage.shodh", "semantic").unwrap());
+        let created = config
+            .storage
+            .shodh
+            .get("semantic")
+            .expect("property surface should create a typed Shodh alias");
+        assert_eq!(created.base_url, "http://127.0.0.1:3030");
+        assert!(config.prop_fields().iter().any(|field| {
+            field.name == "storage.shodh.semantic.api_key"
+                && field.is_secret
+                && field.credential_class
+                    == Some(crate::config::CredentialSurfaceClass::EncryptedSecret)
+        }));
     }
 
     #[test]
@@ -32815,6 +32929,23 @@ allowed_users = []
         assert_eq!(
             config.memory_backend_ref_for_agent("alpha").unwrap(),
             "lucid.pi"
+        );
+    }
+
+    #[test]
+    async fn agent_memory_backend_ref_uses_the_only_configured_shodh_alias() {
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "sqlite.default".to_string();
+        config.agents.get_mut("alpha").unwrap().memory.backend =
+            crate::multi_agent::MemoryBackendKind::Shodh;
+        config
+            .storage
+            .shodh
+            .insert("semantic".to_string(), ShodhStorageConfig::default());
+
+        assert_eq!(
+            config.memory_backend_ref_for_agent("alpha").unwrap(),
+            "shodh.semantic"
         );
     }
 

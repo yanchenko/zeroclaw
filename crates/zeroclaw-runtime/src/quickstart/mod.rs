@@ -602,6 +602,7 @@ fn memory_kind_keys() -> Vec<String> {
         M::Postgres,
         M::Qdrant,
         M::Lucid,
+        M::Shodh,
         M::None,
     ]
     .into_iter()
@@ -610,7 +611,7 @@ fn memory_kind_keys() -> Vec<String> {
         // to compile until the contributor decides whether the new backend
         // belongs in the quickstart picker.
         match k {
-            M::Sqlite | M::Markdown | M::Postgres | M::Qdrant | M::Lucid | M::None => (),
+            M::Sqlite | M::Markdown | M::Postgres | M::Qdrant | M::Lucid | M::Shodh | M::None => (),
         }
         serde_json::to_value(k)
             .ok()

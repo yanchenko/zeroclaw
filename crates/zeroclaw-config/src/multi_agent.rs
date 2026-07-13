@@ -37,7 +37,7 @@ pub enum AccessMode {
 ///
 /// Closed set; the schema is law. The enum mirrors the storage-instance
 /// outer keys under `Config.storage.<kind>.<alias>`: `sqlite`, `postgres`,
-/// `qdrant`, `markdown`, `lucid`, plus `none` for the no-storage case.
+/// `qdrant`, `markdown`, `lucid`, `shodh`, plus `none` for the no-storage case.
 ///
 /// An agent's backend is locked at agent creation and immutable on
 /// subsequent loads. `Config::validate()` enforces immutability against
@@ -64,6 +64,9 @@ pub enum MemoryBackendKind {
     /// Hybrid local SQLite + external Lucid CLI
     /// (`crates/zeroclaw-memory/src/lucid.rs`).
     Lucid,
+    /// Hybrid local SQLite + external Shodh Memory HTTP service
+    /// (`crates/zeroclaw-memory/src/shodh.rs`).
+    Shodh,
 }
 
 impl MemoryBackendKind {
@@ -77,6 +80,7 @@ impl MemoryBackendKind {
             Self::Qdrant => "qdrant",
             Self::Markdown => "markdown",
             Self::Lucid => "lucid",
+            Self::Shodh => "shodh",
         }
     }
 }
@@ -326,6 +330,7 @@ external_peers = ["@user_1", "@user_2"]
             (MemoryBackendKind::Qdrant, "\"qdrant\""),
             (MemoryBackendKind::Markdown, "\"markdown\""),
             (MemoryBackendKind::Lucid, "\"lucid\""),
+            (MemoryBackendKind::Shodh, "\"shodh\""),
         ];
         for (kind, expected) in cases {
             assert_eq!(kind.as_str(), expected.trim_matches('"'));
