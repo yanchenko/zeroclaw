@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 use zeroclaw_api::attribution::MemoryKind;
+use zeroclaw_config::schema::LucidStorageConfig;
 
 /// External-process connector for the `lucid-memory` command-line tool.
 pub struct LucidConnector {
@@ -39,6 +40,42 @@ impl LucidConnector {
             recall_timeout: Duration::from_millis(Self::DEFAULT_RECALL_TIMEOUT_MS),
             store_timeout: Duration::from_millis(Self::DEFAULT_STORE_TIMEOUT_MS),
         }
+    }
+
+    fn from_config(workspace_dir: &Path, config: &LucidStorageConfig) -> anyhow::Result<Self> {
+        fn configured_timeout(
+            value: Option<u64>,
+            default_ms: u64,
+            field: &str,
+        ) -> anyhow::Result<Duration> {
+            let millis = value.unwrap_or(default_ms);
+            if millis == 0 {
+                anyhow::bail!("storage.lucid.{field} must be greater than zero");
+            }
+            Ok(Duration::from_millis(millis))
+        }
+
+        let lucid_cmd = config
+            .binary_path
+            .as_ref()
+            .filter(|path| !path.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| Self::DEFAULT_LUCID_CMD.to_string());
+        Ok(Self {
+            lucid_cmd,
+            token_budget: Self::DEFAULT_TOKEN_BUDGET,
+            workspace_dir: workspace_dir.to_path_buf(),
+            recall_timeout: configured_timeout(
+                config.recall_timeout_ms,
+                Self::DEFAULT_RECALL_TIMEOUT_MS,
+                "recall_timeout_ms",
+            )?,
+            store_timeout: configured_timeout(
+                config.store_timeout_ms,
+                Self::DEFAULT_STORE_TIMEOUT_MS,
+                "store_timeout_ms",
+            )?,
+        })
     }
 
     #[cfg(all(test, unix))]
@@ -140,7 +177,7 @@ impl LucidConnector {
         timeout_window: Duration,
     ) -> anyhow::Result<String> {
         let mut command = Command::new(&self.lucid_cmd);
-        command.args(args);
+        command.args(args).kill_on_drop(true);
 
         let output = timeout(timeout_window, command.output())
             .await
@@ -203,6 +240,24 @@ impl EnrichedMemory<LucidConnector> {
                 Duration::from_millis(Self::DEFAULT_FAILURE_COOLDOWN_MS),
             ),
         )
+    }
+
+    /// Construct Lucid from its resolved typed storage alias.
+    pub fn from_config(
+        alias: &str,
+        workspace_dir: &Path,
+        local: SqliteMemory,
+        config: &LucidStorageConfig,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::from_parts(
+            alias,
+            local,
+            LucidConnector::from_config(workspace_dir, config)?,
+            EnrichmentPolicy::new(
+                Self::DEFAULT_LOCAL_HIT_THRESHOLD,
+                Duration::from_millis(Self::DEFAULT_FAILURE_COOLDOWN_MS),
+            ),
+        ))
     }
 
     #[cfg(all(test, unix))]
@@ -296,6 +351,41 @@ mod tests {
         );
 
         assert_eq!(lucid.embedder_dimensions(), 1536);
+    }
+
+    #[test]
+    fn connector_consumes_typed_binary_and_deadlines() {
+        let tmp = TempDir::new().unwrap();
+        let config = LucidStorageConfig {
+            binary_path: Some("/opt/lucid/bin/lucid".to_string()),
+            recall_timeout_ms: Some(2500),
+            store_timeout_ms: Some(3000),
+        };
+
+        let connector = LucidConnector::from_config(tmp.path(), &config).unwrap();
+        assert_eq!(connector.lucid_cmd, "/opt/lucid/bin/lucid");
+        assert_eq!(connector.recall_timeout, Duration::from_millis(2500));
+        assert_eq!(connector.store_timeout, Duration::from_millis(3000));
+    }
+
+    #[test]
+    fn connector_rejects_zero_deadlines() {
+        let tmp = TempDir::new().unwrap();
+        for config in [
+            LucidStorageConfig {
+                recall_timeout_ms: Some(0),
+                ..LucidStorageConfig::default()
+            },
+            LucidStorageConfig {
+                store_timeout_ms: Some(0),
+                ..LucidStorageConfig::default()
+            },
+        ] {
+            let error = LucidConnector::from_config(tmp.path(), &config)
+                .err()
+                .expect("zero deadline must fail");
+            assert!(error.to_string().contains("must be greater than zero"));
+        }
     }
 
     fn write_fake_lucid_script(dir: &Path) -> String {

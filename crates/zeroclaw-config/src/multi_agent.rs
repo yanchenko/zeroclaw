@@ -66,6 +66,21 @@ pub enum MemoryBackendKind {
     Lucid,
 }
 
+impl MemoryBackendKind {
+    /// Canonical storage kind used in dotted backend references.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+            Self::Qdrant => "qdrant",
+            Self::Markdown => "markdown",
+            Self::Lucid => "lucid",
+        }
+    }
+}
+
 /// Per-agent filesystem and cross-agent access settings, nested under
 /// `[agents.<alias>.workspace]`.
 ///
@@ -313,6 +328,7 @@ external_peers = ["@user_1", "@user_2"]
             (MemoryBackendKind::Lucid, "\"lucid\""),
         ];
         for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected.trim_matches('"'));
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, expected, "backend={kind:?}");
             let back: MemoryBackendKind = serde_json::from_str(&json).unwrap();

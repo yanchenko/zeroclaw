@@ -4370,17 +4370,13 @@ impl Config {
             })
     }
 
-    /// Resolve the active storage backend for the memory subsystem.
+    /// Resolve one dotted storage reference against the canonical storage maps.
     ///
-    /// `MemoryConfig.backend` is a dotted reference (`<backend>.<alias>`) into
-    /// `Config.storage.<backend>.<alias>`. Bare backend names are interpreted
-    /// as `<backend>.default` for back-compat.
-    ///
-    /// Returns `ActiveStorage::None` when no backend is configured, when the
-    /// backend is `"none"`, or when the dotted alias does not resolve to a
-    /// configured entry.
-    pub fn resolve_active_storage(&self) -> ActiveStorage<'_> {
-        let backend = self.memory.backend.trim();
+    /// Bare backend names are interpreted as `<backend>.default` for back-compat.
+    /// Returns [`ActiveStorage::None`] when the reference is empty, names `none`,
+    /// or does not resolve to a configured entry.
+    pub fn resolve_storage_ref(&self, backend: &str) -> ActiveStorage<'_> {
+        let backend = backend.trim();
         if backend.is_empty() || backend.eq_ignore_ascii_case("none") {
             return ActiveStorage::None;
         }
@@ -4418,6 +4414,74 @@ impl Config {
                 .unwrap_or(ActiveStorage::None),
             _ => ActiveStorage::None,
         }
+    }
+
+    /// Resolve the install-wide memory storage selected by [`MemoryConfig`].
+    pub fn resolve_active_storage(&self) -> ActiveStorage<'_> {
+        self.resolve_storage_ref(&self.memory.backend)
+    }
+
+    /// Return the effective storage reference for one configured agent.
+    ///
+    /// The agent's typed backend is authoritative. When the install-wide
+    /// [`MemoryConfig::backend`] selects the same backend kind, its alias is
+    /// reused. Otherwise `default` is preferred, a sole configured instance is
+    /// unambiguous, multiple non-default instances are rejected, and an empty
+    /// storage map keeps the legacy bare backend defaults. Markdown remains
+    /// per-agent and `none` has no storage alias.
+    pub fn memory_backend_ref_for_agent(&self, agent_alias: &str) -> Result<String> {
+        use crate::multi_agent::MemoryBackendKind;
+
+        let agent = self
+            .agents
+            .get(agent_alias)
+            .with_context(|| format!("agents.{agent_alias} is not configured"))?;
+        let backend = agent.memory.backend;
+        let kind = backend.as_str();
+
+        match backend {
+            MemoryBackendKind::None => return Ok("none".to_string()),
+            MemoryBackendKind::Markdown => return Ok(format!("markdown.{agent_alias}")),
+            _ => {}
+        }
+
+        let global = self.memory.backend.trim();
+        let global_parts = global.split_once('.');
+        let (global_kind, global_alias) = global_parts.unwrap_or((global, "default"));
+        if global_kind.eq_ignore_ascii_case(kind) && !global_alias.trim().is_empty() {
+            return Ok(global_parts.map_or_else(
+                || kind.to_string(),
+                |(_, alias)| format!("{kind}.{}", alias.trim()),
+            ));
+        }
+
+        let aliases: Vec<&str> = match backend {
+            MemoryBackendKind::Sqlite => self.storage.sqlite.keys().map(String::as_str).collect(),
+            MemoryBackendKind::Postgres => {
+                self.storage.postgres.keys().map(String::as_str).collect()
+            }
+            MemoryBackendKind::Qdrant => self.storage.qdrant.keys().map(String::as_str).collect(),
+            MemoryBackendKind::Lucid => self.storage.lucid.keys().map(String::as_str).collect(),
+            MemoryBackendKind::None | MemoryBackendKind::Markdown => unreachable!(),
+        };
+        if aliases.is_empty() {
+            return Ok(kind.to_string());
+        }
+        if aliases.contains(&"default") {
+            return Ok(format!("{kind}.default"));
+        }
+        if let [alias] = aliases.as_slice() {
+            return Ok(format!("{kind}.{alias}"));
+        }
+
+        let mut aliases = aliases;
+        aliases.sort_unstable();
+        anyhow::bail!(
+            "agents.{agent_alias}.memory.backend selects {kind}, but multiple \
+             storage.{kind} aliases are configured without a default: {}; set \
+             memory.backend to the intended {kind}.<alias> or add storage.{kind}.default",
+            aliases.join(", ")
+        )
     }
 }
 
@@ -10257,6 +10321,12 @@ pub struct MarkdownStorageConfig {
 pub struct LucidStorageConfig {
     /// Optional path to the lucid-memory binary.
     pub binary_path: Option<String>,
+    /// Maximum milliseconds allowed for a Lucid context/recall command.
+    /// Defaults to 500 when omitted and must be greater than zero when set.
+    pub recall_timeout_ms: Option<u64>,
+    /// Maximum milliseconds allowed for a Lucid store command.
+    /// Defaults to 800 when omitted and must be greater than zero when set.
+    pub store_timeout_ms: Option<u64>,
 }
 
 fn default_storage_schema() -> String {
@@ -18670,6 +18740,22 @@ impl Config {
             }
         }
 
+        for (alias, lucid) in &self.storage.lucid {
+            for (field, value) in [
+                ("recall_timeout_ms", lucid.recall_timeout_ms),
+                ("store_timeout_ms", lucid.store_timeout_ms),
+            ] {
+                if value == Some(0) {
+                    let path = format!("storage.lucid.{alias}.{field}");
+                    validation_bail!(
+                        InvalidNumericRange,
+                        path,
+                        "{path} must be greater than 0 when configured"
+                    );
+                }
+            }
+        }
+
         // Reply-pacing bounds — both `reply_min_interval_secs` and
         // `reply_queue_depth_max` walk through one entry list so adding
         // a new paced channel only requires extending `reply_pacing_entries`.
@@ -23403,6 +23489,55 @@ auto_save = true
         assert_eq!(pg.vector_dimensions, 1536);
         assert_eq!(pg.schema, "public");
         assert_eq!(pg.table, "memories");
+    }
+
+    #[test]
+    async fn storage_lucid_alias_bridge_options_round_trip() {
+        let toml = r#"
+            [lucid.pi]
+            binary_path = "/opt/lucid/bin/lucid"
+            recall_timeout_ms = 2500
+            store_timeout_ms = 3000
+        "#;
+        let parsed: StorageConfig = toml::from_str(toml).unwrap();
+        let lucid = parsed.lucid.get("pi").expect("alias present");
+        assert_eq!(lucid.binary_path.as_deref(), Some("/opt/lucid/bin/lucid"));
+        assert_eq!(lucid.recall_timeout_ms, Some(2500));
+        assert_eq!(lucid.store_timeout_ms, Some(3000));
+
+        let defaults: LucidStorageConfig = toml::from_str("").unwrap();
+        assert!(defaults.binary_path.is_none());
+        assert!(defaults.recall_timeout_ms.is_none());
+        assert!(defaults.store_timeout_ms.is_none());
+    }
+
+    #[test]
+    async fn validate_rejects_zero_lucid_command_deadlines() {
+        for (field, config) in [
+            (
+                "recall_timeout_ms",
+                LucidStorageConfig {
+                    recall_timeout_ms: Some(0),
+                    ..LucidStorageConfig::default()
+                },
+            ),
+            (
+                "store_timeout_ms",
+                LucidStorageConfig {
+                    store_timeout_ms: Some(0),
+                    ..LucidStorageConfig::default()
+                },
+            ),
+        ] {
+            let mut root = Config::default();
+            root.storage.lucid.insert("pi".to_string(), config);
+            let error = root.validate().expect_err("zero deadline must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("storage.lucid.pi.{field}"))
+            );
+        }
     }
 
     #[test]
@@ -32638,6 +32773,69 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    #[test]
+    async fn agent_memory_backend_ref_prefers_the_agent_backend_kind() {
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "sqlite.default".to_string();
+        config.agents.get_mut("alpha").unwrap().memory.backend =
+            crate::multi_agent::MemoryBackendKind::Lucid;
+
+        assert_eq!(
+            config.memory_backend_ref_for_agent("alpha").unwrap(),
+            "lucid"
+        );
+    }
+
+    #[test]
+    async fn agent_memory_backend_ref_reuses_matching_global_alias() {
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "lucid.pi".to_string();
+        config.agents.get_mut("alpha").unwrap().memory.backend =
+            crate::multi_agent::MemoryBackendKind::Lucid;
+
+        assert_eq!(
+            config.memory_backend_ref_for_agent("alpha").unwrap(),
+            "lucid.pi"
+        );
+    }
+
+    #[test]
+    async fn agent_memory_backend_ref_uses_the_only_configured_alias() {
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "sqlite.default".to_string();
+        config.agents.get_mut("alpha").unwrap().memory.backend =
+            crate::multi_agent::MemoryBackendKind::Lucid;
+        config
+            .storage
+            .lucid
+            .insert("pi".to_string(), LucidStorageConfig::default());
+
+        assert_eq!(
+            config.memory_backend_ref_for_agent("alpha").unwrap(),
+            "lucid.pi"
+        );
+    }
+
+    #[test]
+    async fn agent_memory_backend_ref_rejects_ambiguous_aliases() {
+        let mut config = multi_agent_test_config();
+        config.memory.backend = "sqlite.default".to_string();
+        config.agents.get_mut("alpha").unwrap().memory.backend =
+            crate::multi_agent::MemoryBackendKind::Lucid;
+        for alias in ["pi", "workstation"] {
+            config
+                .storage
+                .lucid
+                .insert(alias.to_string(), LucidStorageConfig::default());
+        }
+
+        let error = config
+            .memory_backend_ref_for_agent("alpha")
+            .expect_err("multiple aliases without default must be rejected");
+        assert!(error.to_string().contains("multiple storage.lucid aliases"));
+        assert!(error.to_string().contains("pi, workstation"));
     }
 
     #[test]

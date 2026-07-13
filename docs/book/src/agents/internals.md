@@ -26,6 +26,15 @@ SubAgent spawns enforce the rule that a child cannot escalate beyond its parent.
 
 Each agent has its own `Arc<dyn Memory>` instance. The factory (`zeroclaw_memory::create_memory_for_agent`) dispatches by backend kind:
 
+The backend kind under `agents.<alias>.memory.backend` is authoritative. For
+shared backends, the factory reuses the alias from the install-wide
+`memory.backend` reference when it names the same kind. Otherwise it prefers
+the selected kind's `default` storage alias, uses the only configured alias
+when there is exactly one, retains the legacy bare backend defaults when none
+are configured, and rejects multiple non-default aliases as ambiguous. This
+keeps legacy global aliases working while ensuring an agent configured for
+Lucid cannot silently receive the global SQLite backend.
+
 - **SQLite / Postgres / Lucid**: shared install-wide store. The `agents` table maps alias → UUID, and the `memories` table carries `agent_id` referencing that UUID. The factory wraps the inner backend in `AgentScopedMemory`, which stamps the bound agent's UUID on every store via `store_with_agent` and filters every recall via `recall_for_agents` with the resolved allowlist.
 - **Markdown**: per-agent dir. Each agent's `MarkdownMemory` writes to `<install>/agents/<alias>/workspace/MEMORY.md` and `memory/YYYY-MM-DD.md`. Cross-agent recall is composed by `AgentScopedMarkdownMemory`, which holds the bound agent's `MarkdownMemory` plus a peer set of `(alias, MarkdownMemory)` pairs and unions their results with `[<alias>] ` attribution prefixes on each row.
 - **Qdrant**: shared collection, payload-keyed. The `agent_id` payload field is the per-agent attribution; `recall_for_agents` over-fetches and post-filters by payload.

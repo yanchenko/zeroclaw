@@ -502,9 +502,9 @@ pub fn create_memory(
 /// Factory: create memory with a resolved active storage backend and embedding routes.
 ///
 /// Pass [`ActiveStorage::None`] when no typed storage config is needed (sqlite,
-/// markdown, lucid, none — all infer settings from the workspace). Postgres and
-/// Qdrant require their typed variants and will error if the wrong variant is
-/// supplied.
+/// markdown, none, or legacy bare Lucid defaults). A configured Lucid alias is
+/// consumed when supplied. Postgres and Qdrant require their typed variants and
+/// will error if the wrong variant is supplied.
 ///
 /// `providers` is the canonical `providers.models` catalog, used to resolve a
 /// dotted `<type>.<alias>` embedding `model_provider` reference (from
@@ -642,6 +642,27 @@ pub fn create_memory_with_storage_and_routes(
         ActiveStorage::Sqlite(sq) => sq.open_timeout_secs,
         _ => None,
     };
+
+    if matches!(backend_kind, MemoryBackendKind::Lucid) {
+        let local = build_sqlite_memory(config, None, workspace_dir, &resolved_embedding)?;
+        let memory = match active_storage {
+            ActiveStorage::Lucid(lucid) => {
+                LucidMemory::from_config("lucid", workspace_dir, local, lucid)?
+            }
+            ActiveStorage::None if !config.backend.trim().contains('.') => {
+                LucidMemory::new("lucid", workspace_dir, local)
+            }
+            ActiveStorage::None => anyhow::bail!(
+                "memory backend '{}' requires a matching `[storage.lucid.<alias>]` entry",
+                config.backend.trim()
+            ),
+            other => anyhow::bail!(
+                "memory backend 'lucid' received incompatible '{}' storage config",
+                other.kind()
+            ),
+        };
+        return Ok(Box::new(memory));
+    }
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
         let qdrant_cfg = match active_storage {
@@ -926,10 +947,13 @@ pub async fn create_memory_for_agent(
     // install-wide factory using the install workspace_dir, then wrap
     // with AgentScopedMemory holding the agent's UUID + resolved
     // allowlist UUIDs.
+    let backend_ref = config.memory_backend_ref_for_agent(agent_alias)?;
+    let mut memory_config = config.memory.clone();
+    memory_config.backend.clone_from(&backend_ref);
     let inner = create_memory_with_storage_and_routes(
-        &config.memory,
+        &memory_config,
         &config.embedding_routes,
-        config.resolve_active_storage(),
+        config.resolve_storage_ref(&backend_ref),
         &config.data_dir,
         api_key,
         Some(&config.providers.models),
@@ -992,8 +1016,84 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
     use zeroclaw_config::schema::EmbeddingRouteConfig;
+    #[cfg(unix)]
+    use zeroclaw_config::schema::{Config, LucidStorageConfig};
+
+    #[cfg(unix)]
+    fn write_timed_lucid_script(
+        directory: &Path,
+        invocations: &Path,
+        completions: &Path,
+        context_pid: &Path,
+    ) -> String {
+        let script_path = directory.join("timed-lucid.sh");
+        let context_fifo = directory.join("timed-lucid-context.fifo");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+
+printf '%s\n' "${{1:-}}" >> "{}"
+if [ "${{1:-}}" = "store" ]; then
+  printf 'store\n' >> "{}"
+  echo '{{"success":true,"id":"configured_store"}}'
+  exit 0
+fi
+
+if [ "${{1:-}}" = "context" ]; then
+  rm -f "{}"
+  mkfifo "{}"
+  printf '%s\n' "$$" > "{}"
+  read -r _value < "{}"
+fi
+
+exit 1
+"#,
+            invocations.display(),
+            completions.display(),
+            context_fifo.display(),
+            context_fifo.display(),
+            context_pid.display(),
+            context_fifo.display()
+        );
+        fs::write(&script_path, script).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+        script_path.display().to_string()
+    }
+
+    #[cfg(unix)]
+    fn write_recording_lucid_script(directory: &Path, invocations: &Path) -> String {
+        let script_path = directory.join("recording-lucid.sh");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+
+printf '%s\n' "${{1:-}}" >> "{}"
+if [ "${{1:-}}" = "store" ]; then
+  echo '{{"success":true,"id":"configured_store"}}'
+  exit 0
+fi
+if [ "${{1:-}}" = "context" ]; then
+  echo '<lucid-context></lucid-context>'
+  exit 0
+fi
+exit 1
+"#,
+            invocations.display()
+        );
+        fs::write(&script_path, script).unwrap();
+        let mut permissions = fs::metadata(&script_path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).unwrap();
+        script_path.display().to_string()
+    }
 
     #[test]
     fn factory_sqlite() {
@@ -1260,6 +1360,167 @@ mod tests {
         };
         let mem = create_memory(&cfg, tmp.path(), None).unwrap();
         assert_eq!(mem.name(), "lucid");
+    }
+
+    #[test]
+    fn factory_lucid_without_explicit_storage_alias_errors() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "lucid.pi".into(),
+            ..MemoryConfig::default()
+        };
+        let error = create_memory(&cfg, tmp.path(), None)
+            .err()
+            .expect("an explicit Lucid alias must resolve");
+        assert!(error.to_string().contains("storage.lucid"));
+        assert!(error.to_string().contains("lucid.pi"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn factory_lucid_applies_configured_binary_and_command_deadlines() {
+        let tmp = TempDir::new().unwrap();
+        let invocations = tmp.path().join("invocations.log");
+        let completions = tmp.path().join("completions.log");
+        let context_pid = tmp.path().join("context.pid");
+        let storage = LucidStorageConfig {
+            binary_path: Some(write_timed_lucid_script(
+                tmp.path(),
+                &invocations,
+                &completions,
+                &context_pid,
+            )),
+            recall_timeout_ms: Some(5_000),
+            store_timeout_ms: Some(5_000),
+        };
+        let cfg = MemoryConfig {
+            backend: "lucid.pi".to_string(),
+            ..MemoryConfig::default()
+        };
+        let memory = create_memory_with_storage_and_routes(
+            &cfg,
+            &[],
+            ActiveStorage::Lucid(&storage),
+            tmp.path(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        memory
+            .store(
+                "local_probe",
+                "authoritative local row",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(memory.get("local_probe").await.unwrap().is_some());
+
+        let recall_started = std::time::Instant::now();
+        let recalled = memory
+            .recall("remoteprobe", 5, None, None, None)
+            .await
+            .unwrap();
+        let recall_elapsed = recall_started.elapsed();
+        assert!(
+            recall_elapsed >= std::time::Duration::from_secs(4),
+            "typed recall deadline was not applied: {recall_elapsed:?}"
+        );
+        assert!(
+            recalled
+                .iter()
+                .all(|entry| !entry.content.contains("remoteprobe")),
+            "configured recall deadline must preserve local fallback"
+        );
+
+        let invoked = tokio::fs::read_to_string(&invocations)
+            .await
+            .unwrap_or_default();
+        assert_eq!(invoked.lines().collect::<Vec<_>>(), ["store", "context"]);
+        assert_eq!(
+            tokio::fs::read_to_string(&completions).await.unwrap(),
+            "store\n"
+        );
+
+        let pid = tokio::fs::read_to_string(&context_pid)
+            .await
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut process_still_exists = true;
+        for _ in 0..100 {
+            process_still_exists = std::process::Command::new("/bin/kill")
+                .args(["-0", pid.as_str()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if !process_still_exists {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_still_exists,
+            "timed-out Lucid process {pid} survived"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn agent_lucid_backend_overrides_global_sqlite_and_keeps_local_rows() {
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind as ConfigBackend};
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let invocations = tmp.path().join("agent-invocations.log");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            memory: MemoryConfig {
+                backend: "sqlite.default".to_string(),
+                ..MemoryConfig::default()
+            },
+            ..Config::default()
+        };
+        config.storage.lucid.insert(
+            "pi".to_string(),
+            LucidStorageConfig {
+                binary_path: Some(write_recording_lucid_script(tmp.path(), &invocations)),
+                recall_timeout_ms: Some(5_000),
+                store_timeout_ms: Some(5_000),
+            },
+        );
+        config.agents.insert(
+            "pi400".to_string(),
+            AliasedAgentConfig {
+                memory: AgentMemoryConfig {
+                    backend: ConfigBackend::Lucid,
+                },
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let memory = create_memory_for_agent(&config, "pi400", None)
+            .await
+            .unwrap();
+        assert_eq!(memory.name(), "lucid");
+        memory
+            .store(
+                "agent_probe",
+                "SQLite stays authoritative",
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let invoked = tokio::fs::read_to_string(&invocations).await.unwrap();
+        assert_eq!(invoked.lines().collect::<Vec<_>>(), ["store"]);
+        let local = memory.get("agent_probe").await.unwrap().unwrap();
+        assert_eq!(local.content, "SQLite stays authoritative");
+        assert!(local.agent_id.is_some());
     }
 
     #[test]
