@@ -34,6 +34,7 @@ pub mod consolidation;
 pub mod decay;
 pub mod dedup;
 pub mod embeddings;
+mod enriched;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
