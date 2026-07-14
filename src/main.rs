@@ -1828,7 +1828,7 @@ async fn run_quickstart_cli(
                 }
             }
             Action::Memory => {
-                // Schema-derived list — seven variants today, more as
+                // Schema-derived list — five variants today, more as
                 // soon as someone adds them to
                 // `zeroclaw_config::multi_agent::MemoryBackendKind`.
                 // The exhaustive `match` here keeps the variant
