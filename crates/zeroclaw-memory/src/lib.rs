@@ -1579,6 +1579,7 @@ mod tests {
             ..MemoryConfig::default()
         };
         let storage = ShodhEnrichmentConfig {
+            endpoint: "test-shodh.sock".into(),
             api_key: Some("test-key".into()),
             ..ShodhEnrichmentConfig::default()
         };
