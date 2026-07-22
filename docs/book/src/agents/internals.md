@@ -24,20 +24,41 @@ SubAgent spawns enforce the rule that a child cannot escalate beyond its parent.
 
 ## Memory model
 
-Each agent has its own `Arc<dyn Memory>` instance. The factory (`zeroclaw_memory::create_memory_for_agent`) dispatches by backend kind:
+Each agent has its own `Arc<dyn Memory>` instance. The factory
+(`zeroclaw_memory::create_memory_for_agent`) first resolves the authoritative
+backend and then optionally composes the configured enrichment connector.
 
-- **SQLite / Postgres / Lucid**: shared install-wide store. The `agents` table maps alias → UUID, and the `memories` table carries `agent_id` referencing that UUID. The factory wraps the inner backend in `AgentScopedMemory`, which stamps the bound agent's UUID on every store via `store_with_agent` and filters every recall via `recall_for_agents` with the resolved allowlist.
+The backend kind under `agents.<alias>.memory.backend` is authoritative. For
+shared backends, the factory reuses the alias from the install-wide
+`memory.backend` reference when it names the same kind. Otherwise it prefers
+the selected kind's `default` storage alias, uses the only configured alias
+when there is exactly one, retains the legacy bare backend defaults when none
+are configured, and rejects multiple non-default aliases as ambiguous. The
+optional `agents.<alias>.memory.enricher` field inherits `memory.enricher`,
+selects a different connector alias, or uses `"none"` to disable inheritance.
+It does not participate in durable-backend locking.
+
+- **SQLite / Postgres**: shared install-wide SQL store. The `agents` table maps alias → UUID, and the `memories` table carries `agent_id` referencing that UUID. The factory wraps the inner backend in `AgentScopedMemory`, which stamps the bound agent's UUID on every store via `store_with_agent` and filters every recall via `recall_for_agents` with the resolved allowlist.
+- **SQLite with memory enrichment**: the same shared SQLite store remains canonical. One shared enrichment wrapper owns local-first fallback, scoping, merging, cooldown, and cleanup dispatch. Lucid contains only protocol translation and capability declarations. Its CLI cannot express scoped external recall, so enrichment stays local-only when an agent allowlist is required.
 - **Markdown**: per-agent dir. Each agent's `MarkdownMemory` writes to `<install>/agents/<alias>/workspace/MEMORY.md` and `memory/YYYY-MM-DD.md`. Cross-agent recall is composed by `AgentScopedMarkdownMemory`, which holds the bound agent's `MarkdownMemory` plus a peer set of `(alias, MarkdownMemory)` pairs and unions their results with `[<alias>] ` attribution prefixes on each row.
 - **Qdrant**: shared collection, payload-keyed. The `agent_id` payload field is the per-agent attribution; `recall_for_agents` over-fetches and post-filters by payload.
 - **None**: no-op stub. The wrapper still exists so the runtime path is uniform.
 
 Cross-backend cross-agent memory is not supported: the schema validator at config load rejects `read_memory_from` entries that point at a sibling on a different backend.
 
+## Rename and delete lifecycle
+
+Use the gateway dashboard's agent controls or the dedicated `zeroclaw agents` CLI for rename and delete. In the standard build with `gateway` and `agent-runtime` enabled, both surfaces run the reference and owned-state cascades; directly removing or re-keying `agents.<alias>` in TOML or through a generic config setter does not. A reduced-feature CLI still updates config references but warns that owned state was not cascaded, so use a build with both features enabled for lifecycle operations.
+
+Both operations make the config change durable before running owned-state side effects. Rename rewrites config references first, then moves the default per-alias workspace and re-points memory, cron, ACP, and session state. Delete first refuses hard references and live ACP sessions, then removes the config entry and soft references before attempting workspace archival, owned-state export and cleanup, and session-attribution clearing.
+
+The post-persist side effects are best-effort and report surfaced failures, but archive-file write failures may appear only in gateway logs. Rename warnings call for retrying the same gateway API rename to converge residue left under the old alias. After deletion, verify the archive contents and logs before relying on the archive for recovery. Automated restore is not supported.
+
+See [Multi-agent setup walkthrough](../contributing/multi-agent-setup.md#rename-an-agent) for the current controls, blockers, archive layout, and operator checks.
+
 ## Not supported today
 
 1. Cross-backend cross-agent memory access (e.g. SQLite agent reading a Postgres agent's rows).
-2. Agent rename (the `agents.id` UUID indirection is the rename-ready foundation, but no CLI/UI surface exists).
-3. Pre-delete archive and restore.
-4. Per-agent secret namespacing: there is a single workspace-wide `SecretStore`.
-5. Lucid wire-format extensions for cross-agent scoping.
-6. A dedicated `zeroclaw agents` management CLI for creating/deleting/listing agents.
+2. Automated restore from an agent deletion archive.
+3. Per-agent secret namespacing: there is a single workspace-wide `SecretStore`.
+4. Lucid wire-format extensions for cross-agent scoping.

@@ -8,11 +8,6 @@ use crate::schema::v2::V2Config;
 /// The schema version this binary writes and expects on disk.
 pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
-/// Attribution surface for config load/migration emissions. Config loading
-/// runs before any entry-point attribution span exists, so the migration
-/// entry points open their own System-role span; every `record!` inside
-/// then carries `zc_role = system` and the queryable `system_alias = config`
-/// field instead of landing un-attributed.
 pub(crate) struct ConfigLoadAttribution;
 
 impl zeroclaw_api::attribution::Attributable for ConfigLoadAttribution {
@@ -24,11 +19,6 @@ impl zeroclaw_api::attribution::Attributable for ConfigLoadAttribution {
     }
 }
 
-/// Top-level TOML keys that legacy schema versions had but V3 either
-/// removed or restructured. Suppresses "unknown key" warnings on V1/V2
-/// configs flowing through `migrate_to_current`: every key here is
-/// consumed by `V1Config::migrate` or `V2Config::migrate`, so it's
-/// expected on a stale-but-being-migrated config.
 pub const V1_LEGACY_KEYS: &[&str] = &[
     "api_key",
     "api_url",
@@ -49,11 +39,6 @@ pub const V1_LEGACY_KEYS: &[&str] = &[
     "cron",
 ];
 
-/// Detect a config's schema version from its parsed TOML representation.
-///
-/// - Missing top-level `schema_version` key → V1 (pre-versioned).
-/// - Integer ≥ 1 → that integer.
-/// - Anything else → error.
 pub fn detect_version(value: &toml::Value) -> Result<u32> {
     let table = value
         .as_table()
@@ -74,15 +59,6 @@ pub fn detect_version(value: &toml::Value) -> Result<u32> {
     }
 }
 
-/// Pure migration from any supported version's TOML string into the current
-/// schema version's TOML string. Returns `Ok(None)` when the input is already
-/// at `CURRENT_SCHEMA_VERSION`.
-///
-/// Comments and decoration on keys whose dotted path survives the migration
-/// are preserved via `toml_edit::DocumentMut` reconciliation (`sync_table`).
-/// Keys that are renamed, removed, or restructured lose their comments — the
-/// `.backup` file written by `migrate_file_in_place` retains the original
-/// for manual recovery.
 pub fn migrate_file(input: &str) -> Result<Option<String>> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
@@ -104,7 +80,8 @@ pub fn migrate_file(input: &str) -> Result<Option<String>> {
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
         );
     }
-    let migrated_value = run_chain(value, from)?;
+    let mut migrated_value = run_chain(value, from)?;
+    apply_legacy_lucid_memory_compat(&mut migrated_value)?;
     let migrated_table = match migrated_value {
         toml::Value::Table(t) => t,
         _ => {
@@ -145,20 +122,6 @@ pub struct GenerateOptions<'a> {
     pub secret_store_dir: Option<&'a Path>,
 }
 
-/// Generate a canonical TOML config at `target_version`, derived by
-/// running the V1 fixture forward through the typed migration chain.
-///
-/// `target_version` must be in `1..=CURRENT_SCHEMA_VERSION`. The chain is
-/// the same one used to migrate real on-disk configs — V1 fixture →
-/// `V1Config::migrate` → V2 typed value → `V2Config::migrate` → V3 typed
-/// value — so `generate <n>` shows exactly the shape an operator running
-/// `zeroclaw config migrate` would land on if they started from the V1
-/// fixture.
-///
-/// When [`GenerateOptions::encrypt_secrets`] is set, secret-bearing
-/// string values (api_key, bot_token, access_token, etc. — see
-/// `SECRET_KEY_NAMES`) are ChaCha20-Poly1305-encrypted with the
-/// `.secret_key` under `secret_store_dir`. Works at every version.
 pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<String> {
     if target_version == 0 || target_version > CURRENT_SCHEMA_VERSION {
         anyhow::bail!(
@@ -189,18 +152,6 @@ pub fn generate(target_version: u32, opts: &GenerateOptions<'_>) -> Result<Strin
     toml::to_string_pretty(&value).context("failed to serialize generated config")
 }
 
-/// Set of TOML terminal key names whose string leaves are treated as
-/// secrets by [`encrypt_secret_strings`]. Sourced from
-/// `Config::secret_field_terminals()`, the macro-emitted static
-/// enumeration of every `#[secret]` field reachable from the schema.
-/// The set is schema-driven — adding a new `#[secret]` annotation
-/// anywhere in the schema automatically extends encryption coverage
-/// with no companion edit in this module.
-///
-/// `secret_field_terminals()` (vs. the older `prop_fields().filter(is_secret)`
-/// approach) covers compound shapes like `HashMap<String, String>`
-/// — `prop_fields()` intentionally skips non-Vec compound types, which
-/// would silently drop e.g. `mcp.servers[*].headers` from the allowlist.
 fn secret_key_names() -> &'static std::collections::HashSet<&'static str> {
     use std::collections::HashSet;
     use std::sync::OnceLock;
@@ -208,15 +159,6 @@ fn secret_key_names() -> &'static std::collections::HashSet<&'static str> {
     CACHE.get_or_init(|| Config::secret_field_terminals().into_iter().collect())
 }
 
-/// Walk a TOML tree and encrypt every string leaf whose terminal key
-/// name appears in `secret_key_names`. Strings already in `enc2:` /
-/// `enc:` form are left alone (idempotent). Arrays of strings under a
-/// matching key (e.g. `paired_tokens`) are encrypted element-wise.
-///
-/// Works at every schema version because it operates on raw TOML
-/// rather than a typed `#[secret]` index — only the *set of key names
-/// to encrypt* comes from the typed schema; the walker itself doesn't
-/// care about types.
 pub fn encrypt_secret_strings(
     value: &mut toml::Value,
     store: &crate::secrets::SecretStore,
@@ -251,17 +193,6 @@ fn encrypt_walk(
     Ok(())
 }
 
-/// Encrypt the value at this slot — a string, an array of strings, or
-/// a table containing strings — using the given store. Non-string leaves
-/// (numbers, bools) are left alone; the operator presumably annotated a
-/// non-secret field with a secret-shaped name and we don't second-guess.
-///
-/// When the slot is a Table (e.g. `headers = { Authorization = "Bearer
-/// ...", X-Tenant = "..." }`), every leaf in the subtree is encrypted —
-/// the parent key matched the secret allowlist, so every value below it
-/// inherits the secret marker. This is the contract for `HashMap<String,
-/// String>`-shaped `#[secret]` fields where individual keys are
-/// user-supplied and can't be checked against a static allowlist.
 fn encrypt_in_place(value: &mut toml::Value, store: &crate::secrets::SecretStore) -> Result<()> {
     match value {
         toml::Value::String(s)
@@ -308,12 +239,6 @@ pub fn migrate_to_current_resilient(input: &str) -> Config {
 /// them in [`ResilientLoad::dropped_security`] for exposure gating.
 pub const SECURITY_CRITICAL_KEYS: &[&str] = &["security", "risk_profiles", "peer_groups"];
 
-/// Sentinel `dropped_security` entry used when the *whole* config is replaced
-/// by `Config::default()` (unparseable TOML, unsupported future schema, broken
-/// migration chain, or a root that cannot be salvaged section-by-section). In
-/// that case every security-critical section is lost at once, so the posture is
-/// degraded and the serving gate must refuse to start without an explicit
-/// operator override — exactly as it does for a single dropped section.
 pub const WHOLE_CONFIG_SENTINEL: &str = "<entire-config>";
 
 /// Result of a resilient (never-failing) config load.
@@ -328,11 +253,6 @@ pub struct ResilientLoad {
     pub dropped_security: Vec<String>,
 }
 
-/// Daemon load path with a salvage report. Degrades instead of failing:
-/// strict deserialize first; else drop each invalid channel alias, channel
-/// type, and top-level section (substituting `Default`); else fall back to
-/// `Config::default()`. Security-critical drops log ERROR and surface in
-/// `dropped_security`. `Config::validate()` is intentionally not run.
 pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
     let value = match migrate_value(input) {
         Ok(value) => value,
@@ -363,8 +283,8 @@ pub fn migrate_to_current_salvaged(input: &str) -> ResilientLoad {
 fn migrate_value(input: &str) -> Result<toml::Value> {
     let value: toml::Value = toml::from_str(input).context("failed to parse config TOML")?;
     let from = detect_version(&value)?;
-    if from == CURRENT_SCHEMA_VERSION {
-        Ok(value)
+    let mut value = if from == CURRENT_SCHEMA_VERSION {
+        value
     } else if from > CURRENT_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             ERROR,
@@ -380,8 +300,114 @@ fn migrate_value(input: &str) -> Result<toml::Value> {
             "config schema_version {from} is newer than this binary supports ({CURRENT_SCHEMA_VERSION})"
         )
     } else {
-        run_chain(value, from)
+        run_chain(value, from)?
+    };
+    apply_legacy_lucid_memory_compat(&mut value)?;
+    Ok(value)
+}
+
+/// Legacy Lucid memory-backend compatibility (pre-enrichment configs).
+///
+/// Before the storage/enrichment split, `memory.backend = "lucid"` (and
+/// per-agent `agents.<alias>.memory.backend = "lucid"`) selected the hybrid
+/// SQLite + Lucid CLI backend: SQLite was always the authoritative store and
+/// the Lucid CLI only synced alongside it. The V3 schema expresses that
+/// composition as `backend = "sqlite"` + `enricher = "lucid"`, and the typed
+/// backend enum no longer carries a `lucid` variant — without this pass an
+/// upgraded install would hard-fail per-agent deserialization and silently
+/// fall back to markdown on the global path.
+///
+/// The legacy selector is rewritten to the canonical shape *before* typed
+/// deserialization, so every downstream consumer (factory, validation,
+/// status labels) sees `sqlite` + `lucid`:
+///
+/// - no explicit `enricher` at the same scope → `enricher = "lucid"` is
+///   implied (a bare reference; a `[memory_enrichment.lucid.default]` entry
+///   supplies typed settings when present, built-in defaults otherwise);
+/// - an explicit `enricher = "none"` (or empty) wins: enrichment stays off;
+/// - an explicit canonical enricher alongside the legacy backend is rejected
+///   as ambiguous — the config selects Lucid through both the removed and
+///   the canonical surface — per the memory-enrichment RFC's compatibility
+///   section.
+///
+/// Legacy `[storage.lucid.<alias>]` tables are not part of the V3 schema and
+/// are silently ignored by deserialization; `binary_path` moves to
+/// `[memory_enrichment.lucid.<alias>]`.
+fn apply_legacy_lucid_memory_compat(value: &mut toml::Value) -> Result<()> {
+    let Some(root) = value.as_table_mut() else {
+        return Ok(());
+    };
+    if let Some(memory) = root.get_mut("memory").and_then(toml::Value::as_table_mut) {
+        normalize_legacy_lucid_scope(memory, "memory")?;
     }
+    if let Some(agents) = root.get_mut("agents").and_then(toml::Value::as_table_mut) {
+        for (alias, agent) in agents.iter_mut() {
+            let Some(memory) = agent
+                .as_table_mut()
+                .and_then(|agent| agent.get_mut("memory"))
+                .and_then(toml::Value::as_table_mut)
+            else {
+                continue;
+            };
+            normalize_legacy_lucid_scope(memory, &format!("agents.{alias}.memory"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite one `[memory]`-shaped table (global or per-agent) whose `backend`
+/// is the legacy `"lucid"` selector. See [`apply_legacy_lucid_memory_compat`].
+fn normalize_legacy_lucid_scope(memory: &mut toml::Table, scope: &str) -> Result<()> {
+    let is_legacy_lucid = memory
+        .get("backend")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|backend| {
+            let backend = backend.trim().to_ascii_lowercase();
+            backend == "lucid" || backend.starts_with("lucid.")
+        });
+    if !is_legacy_lucid {
+        return Ok(());
+    }
+
+    match memory.get("enricher") {
+        Some(toml::Value::String(enricher))
+            if !enricher.trim().is_empty() && !enricher.trim().eq_ignore_ascii_case("none") =>
+        {
+            anyhow::bail!(
+                "{scope}.backend = \"lucid\" is the removed legacy Lucid backend and cannot \
+                 be combined with the explicit {scope}.enricher = {:?}; remove the legacy \
+                 value (SQLite stays the authoritative store: set {scope}.backend = \
+                 \"sqlite\")",
+                enricher.trim()
+            );
+        }
+        // Explicit "none" (or empty, or a malformed non-string the typed
+        // deserializer will reject itself) wins: no enricher is implied.
+        Some(_) => {}
+        None => {
+            memory.insert(
+                "enricher".to_string(),
+                toml::Value::String("lucid".to_string()),
+            );
+        }
+    }
+    memory.insert(
+        "backend".to_string(),
+        toml::Value::String("sqlite".to_string()),
+    );
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            .with_attrs(::serde_json::json!({ "path": format!("{scope}.backend") })),
+        &format!(
+            "{scope}.backend = \"lucid\" is deprecated; it now runs as SQLite storage with \
+             the Lucid enricher. Set {scope}.backend = \"sqlite\" and {scope}.enricher = \
+             \"lucid\" in config.toml to silence this warning (typed connector settings \
+             live under [memory_enrichment.lucid.<alias>])"
+        )
+    );
+    Ok(())
 }
 
 /// Deserialize a migrated `toml::Value` into `Config`, never failing.
@@ -523,8 +549,6 @@ fn top_level_section_is_invalid(key: &str, section: &toml::Value) -> bool {
     toml::Value::Table(root).try_into::<Config>().is_err()
 }
 
-/// Drop each `[channels.<type>.<alias>]` that fails to deserialize, checked in
-/// isolation so valid siblings survive. Appends `channels.<type>.<alias>`.
 fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>) {
     let Some(channels) = value
         .as_table_mut()
@@ -550,12 +574,6 @@ fn prune_bad_channel_aliases(value: &mut toml::Value, dropped: &mut Vec<String>)
     }
 }
 
-/// Drop each `[providers.<kind>.<family>.<alias>]` that fails to deserialize,
-/// checked in isolation so valid siblings survive. Without this, one
-/// malformed provider alias makes `prune_bad_top_level_sections` drop the
-/// whole `providers` section: every model/tts/transcription provider
-/// vanishes on reload while agents.*.model_provider references dangle.
-/// Appends `providers.<kind>.<family>.<alias>`.
 fn prune_bad_provider_aliases(value: &mut toml::Value, dropped: &mut Vec<String>) {
     let Some(provider_kinds) = value
         .as_table_mut()
@@ -684,22 +702,6 @@ fn channel_alias_is_invalid(chan_type: &str, alias_value: &toml::Value) -> bool 
     toml::Value::Table(channels).try_into::<Config>().is_err()
 }
 
-/// File-API wrapper: read disk config, migrate, write `<file>.backup`
-/// adjacent to the original, then atomically replace the original. Returns
-/// `Ok(None)` when already current.
-///
-/// Backup file is `<config_filename>.backup` (joined cross-platform via
-/// `Path` ops). The write path mirrors `Config::save()` so the documented
-/// durability guarantee holds end-to-end:
-///
-/// 1. Write the migrated content to `<path>.tmp-<uuid>` and fsync it.
-/// 2. Copy the original to `<path>.backup` (existing behavior; recovery
-///    rope if anything later goes wrong).
-/// 3. `rename(<path>.tmp, <path>)` — atomic on Unix and on modern Windows.
-/// 4. Fsync the parent directory so the rename is durable.
-///
-/// On rename failure the temp file is removed and the backup is restored
-/// over the original so the operator never observes a partial write.
 pub fn migrate_file_in_place(path: &Path) -> Result<Option<MigrateReport>> {
     let _attribution = ::zeroclaw_log::attribution_span!(&ConfigLoadAttribution).entered();
     let raw = std::fs::read_to_string(path)
@@ -832,18 +834,6 @@ pub struct MigrateReport {
     pub to_version: u32,
 }
 
-/// Refuse to proceed if the on-disk config is at a stale schema version.
-///
-/// Used by CLI write commands (`config set`, `config patch`, `config init`)
-/// to ensure the user explicitly opts into the migration via
-/// `zeroclaw config migrate` before modifying a stale config — the alternative
-/// would be a silent auto-migrate-on-write, which is harder to audit and
-/// surprises users who didn't realize their config schema had changed.
-///
-/// - Missing file → `Ok(())` (fresh install: nothing to migrate yet).
-/// - Current version → `Ok(())`.
-/// - Stale (or future) version → `Err` with a message that names the disk
-///   version and the command the user needs to run.
 pub fn ensure_disk_at_current_version(path: &Path) -> Result<()> {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
@@ -873,18 +863,6 @@ pub fn ensure_disk_at_current_version(path: &Path) -> Result<()> {
     );
 }
 
-/// Fold a `from_key: String` value into a `to_key: Vec<String>` array on the
-/// same table. Used for the singular→plural channel transforms (V1→V2:
-/// `matrix.room_id` → `allowed_rooms`, `slack.channel_id` → `channel_ids`;
-/// V2→V3: `discord.guild_id` → `guild_ids`, etc.).
-///
-/// - Removes `from_key` from the table.
-/// - If the value was a non-empty string, appends it to `to_key`'s array
-///   (creating the array if missing). Existing entries are preserved; the new
-///   value is deduplicated against current contents.
-/// - Empty strings, non-string types, and missing `from_key` are no-ops.
-///
-/// Returns `true` if a value was actually folded (caller may emit a log line).
 pub(crate) fn fold_string_into_array(
     table: &mut toml::Table,
     from_key: &str,
@@ -918,17 +896,6 @@ pub(crate) fn fold_string_into_array(
 /// One typed migration step: `V_n` TOML → `V_{n+1}` TOML.
 type MigrationStep = fn(toml::Value) -> Result<toml::Value>;
 
-/// Migration steps keyed 1-indexed by `from` version: `MIGRATION_STEPS[n]`
-/// is the step from `V_n` to `V_{n+1}`. Slot 0 is a never-invoked
-/// placeholder so callers can write `&MIGRATION_STEPS[from..target]`
-/// directly — both bounds read as schema-version numbers, no offset math.
-///
-/// To add a new schema version `V_n`:
-/// 1. Add `schema/v{n-1}.rs` with a partial typed lens for the prior shape.
-/// 2. Implement `V{n-1}Config::migrate(self) -> Result<toml::Value>`.
-/// 3. Bump [`CURRENT_SCHEMA_VERSION`] to `n`.
-/// 4. Append a new closure here that deserializes `V{n-1}Config` and calls
-///    its `migrate()`. The compile-time assertion below catches drift.
 const MIGRATION_STEPS: &[MigrationStep] = &[
     // V0 → V1: padding so slot 0 is never indexed. V0 does not exist.
     |_| unreachable!("MIGRATION_STEPS[0] is a 1-indexing pad and is never invoked"),
@@ -961,11 +928,6 @@ fn run_chain(value: toml::Value, from: u32) -> Result<toml::Value> {
     run_chain_until(value, from, CURRENT_SCHEMA_VERSION)
 }
 
-/// Run the typed migration chain from `from` up to `target` (the shape that
-/// is emitted). `target` must be in `from..=CURRENT_SCHEMA_VERSION`.
-///
-/// Used by `migrate_file` / `migrate_to_current` (target = current) and by
-/// [`generate`] (target = any historical version, for fixture generation).
 fn run_chain_until(value: toml::Value, from: u32, target: u32) -> Result<toml::Value> {
     if target < from {
         anyhow::bail!("cannot migrate backwards from V{from} to V{target}");
@@ -983,19 +945,6 @@ fn run_chain_until(value: toml::Value, from: u32, target: u32) -> Result<toml::V
     Ok(cur)
 }
 
-/// Reconcile new typed values into an existing `toml_edit::DocumentMut` so
-/// comments and decoration on surviving keys are preserved across save.
-///
-/// Walks `new` recursively. For each key:
-/// - If the key exists in `doc` AND both sides are tables, recurse.
-/// - If the key exists in `doc` and at least one side is not a table, replace
-///   the value while preserving the key's prefix decor (i.e. the comment lines
-///   that lead the key).
-/// - If the key does not exist in `doc`, insert it.
-///
-/// Removed keys (present in `doc` but absent from `new`) are dropped from `doc`.
-/// This matches the prior crate behavior: the typed schema is authoritative,
-/// and any TOML key not represented in `new` is not part of the current schema.
 pub(crate) fn sync_table(doc: &mut toml_edit::Table, new: &toml::Table) {
     // Drop keys not present in new
     let to_remove: Vec<String> = doc
@@ -1100,6 +1049,56 @@ from_address = "a@example.com"
         assert!(
             !cfg.channels.email.contains_key("fakeemail"),
             "invalid alias must be pruned"
+        );
+    }
+
+    #[test]
+    fn broken_telegram_alias_is_dropped_and_recorded() {
+        // Telegram alias missing the required `bot_token` must not abort the
+        // load; the dropped alias path must be recorded verbatim so `doctor`
+        // can name the exact malformed section (see zeroclaw-runtime's
+        // check_degraded_sections).
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.default]
+enabled = true
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            !load.config.channels.telegram.contains_key("default"),
+            "invalid alias must be pruned, got {:?}",
+            load.config.channels.telegram.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            load.dropped,
+            vec!["channels.telegram.default"],
+            "dropped list must pin the exact malformed section path, got {:?}",
+            load.dropped
+        );
+    }
+
+    #[test]
+    fn complete_telegram_alias_survives() {
+        // Regression companion to broken_telegram_alias_is_dropped_and_recorded:
+        // a complete [channels.telegram.default] (bot_token present) must
+        // survive intact and must not appear in `dropped`.
+        let raw = r#"
+schema_version = 3
+
+[channels.telegram.default]
+enabled = true
+bot_token = "t"
+"#;
+        let load = migrate_to_current_salvaged(raw);
+        assert!(
+            load.config.channels.telegram.contains_key("default"),
+            "a complete alias must survive salvage"
+        );
+        assert!(
+            load.dropped.is_empty(),
+            "a complete alias must not be reported as dropped, got {:?}",
+            load.dropped
         );
     }
 
